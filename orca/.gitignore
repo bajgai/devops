@@ -1,0 +1,35 @@
+# Allowlist: ignore everything Orca writes, then re-include only plain settings
+# that hold no project data, credentials, sessions or history. Anything Orca adds
+# later stays ignored until it is reviewed and listed here.
+/*
+/.*
+
+!/.gitignore
+!/README.md
+
+# App settings
+!/Preferences
+!/http1-compatibility.json
+!/macos-press-and-hold-default.json
+!/orca-profile-index.json
+!/codex-hook-trust.json
+
+# Agent integration code Orca installs
+!/shell-wrappers/
+!/claude-agent-view/
+!/omp-managed-status-extension/
+
+# Never commit these, even if re-included above by mistake
+*.env
+*.key
+*.db
+*.db-*
+*.sqlite*
+*keypair*
+*secret*
+*token*
+*credential*
+*password*
+*.pem
+*.log
+*.jsonl

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "activeProfileId": "local-default",
+  "profiles": [
+    {
+      "id": "local-default",
+      "name": "Personal",
+      "avatar": {
+        "kind": "initials",
+        "initials": "P",
+        "color": "neutral"
+      },
+      "kind": "local",
+      "createdAt": 1793301722148,
+      "updatedAt": 1793301722148,
+      "lastOpenedAt": 1793301722148
+    }
+  ]
+}
