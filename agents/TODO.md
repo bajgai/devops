@@ -199,8 +199,8 @@ Recorded per agent as each one is finished.
 - **Access:** Grok Bot global settings (owner, GUI, `bot/SETUP.md` steps 2-3): local tools on
   Ask, egress tunnel off, six auto-review block rules, spend fixed at $0. Telegram fault alerts
   through `openclaw message send`.
-- **Status:** bot pack reviewed and pushed (data repo `c1b5330`, Mac jobs money-maker `dcc432d`,
-  65 tests pass). Waiting on the owner's GUI steps 2-11; Claude then does step 12 (enable jobs, drill).
+- **Status:** bot pack reviewed and pushed (data repo `5d9ed16`, Mac jobs money-maker `dcc432d`,
+  65 tests pass). Inventory: 64 live products verified 2026-10-29. Waiting on the owner's GUI steps 2-11; Claude then does step 12 (enable jobs, drill).
 
 ## Browser profiles (2026-10-29)
 
