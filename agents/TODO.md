@@ -23,6 +23,7 @@ Each agent gets three things, decided with the owner one agent at a time:
 | 13 | Hermes | `hermes` | done |
 | 14 | Devin | `devin` | done |
 | 15 | OpenClaw | `openclaw` | done |
+| 17 | Grok Bot.app: Income Scout bot | Grok Bot app (cloud bot) | in progress: owner GUI setup |
 
 ## Decisions
 
@@ -183,6 +184,21 @@ Recorded per agent as each one is finished.
 - **Launcher:** `~/.local/bin/codex-browser [--exec] [--cpa] [prompt]` starts the ChatGPT app
   (required: it provides the browser channel) and Chrome, wraps `caffeinate -i`, uses the app's
   bundled codex (matches the plugin) and warns when app, config and plugin versions differ.
+
+### 17. Grok Bot.app: Income Scout (2026-10-29)
+
+- **Personality:** Research-only income scout: finds and validates paid-demand opportunities in
+  6 lanes (sell existing products, business freelance/contract/bounties, software, digital
+  products, video/reels, adjacent B2B); drafts Action Cards, never posts, buys, bids or signs up.
+  Charter, memory facts, 13 skills, 10 routines: `bajgai/income-scout-data` → `bot/`
+  (clone `~/src/income-scout-data`); owner setup checklist `bot/SETUP.md`.
+- **Tools:** none connected (no X, GitHub, Slack, MCP or treg); own receive-only email inbox;
+  writes only to the private repo with a single-repo deploy key. Mac side (no LLM except the
+  Grok-CLI reviewer): `~/src/money-maker/agents/income-scout/` intake, mirror, watchdog,
+  review, notify; config `config/income-scout.toml` (`enabled = false` until first heartbeat).
+- **Access:** Grok Bot global settings (owner, GUI, `bot/SETUP.md` steps 2-3): local tools on
+  Ask, egress tunnel off, six auto-review block rules, spend fixed at $0. Telegram fault alerts
+  through `openclaw message send`.
 
 ## Browser profiles (2026-10-29)
 
