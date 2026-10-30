@@ -167,14 +167,38 @@ Recorded per agent as each one is finished.
 
 ### 16. Codex Browser on GPT-6.1 Terra (2026-10-29)
 
-- **Personality:** Browser operator in the owner's logged-in Chrome: new tabs only, closes its
-  own, never buys/posts/sends/deletes or bypasses logins, captchas or 2FA. `developer_instructions`
-  in the `browser` profile, `~/.codex/browser.config.toml`.
-- **Tools:** bundled `chrome@openai-bundled` plugin (ChatGPT for Chrome extension, Default
-  profile) through `node_repl`; told to skip the in-app browser, the synced `chrome-browser`
-  skill (written for claude-in-chrome tools) and `cua_repl`.
-- **Access:** model `gpt-6.1-terra`, effort medium, ChatGPT login (not CLIProxyAPI).
-  `~/.codex/browser/config.toml`: `approval_mode` and `download_approval_mode` `never_ask`,
-  `full_cdp_access_enabled = true` (set by the owner in the ChatGPT app). The ChatGPT desktop
-  app must be running; without it the plugin fails with "browser access host is unavailable".
+- **Personality:** Browser operator in the owner's Default Chrome profile ("Your Chrome") only:
+  new tabs, closes its own, script first, computer use only for chrome:// pages, Web Store,
+  extension pages, native dialogs and canvas apps. `developer_instructions` in
+  `~/.codex/browser.config.toml` (includes the plugin bootstrap: 1-2 tool calls, ~17 s per task).
+- **Tools:** bundled `chrome@openai-bundled` via `node_repl`. The Cowork skills synced into
+  `~/.agents/skills/synced/` (`chrome-browser`, `built-in-browser`, `computer-use`) are disabled
+  for Codex with `[[skills.config]]` in `~/.codex/config.toml`; they name `mcp__Claude_*` tools.
+- **Access:** `gpt-6.1-terra`, ChatGPT login; `codex-browser --cpa` routes through CLIProxyAPI.
+  `~/.codex/browser/config.toml`: approvals `never_ask`, full CDP access, file URL access on.
+- **Decisions:** Orca Dispatch → `orca orchestration ask`; started by an agent → returns
+  "DECISION NEEDED" for `codex exec resume`; owner at terminal → asks; else Project Head via
+  `orca terminal send`. Payments, publishing, deletions, password/account changes → owner.
+  Explicit instructions in the prompt count as approval (a test form submit went through).
+- **Launcher:** `~/.local/bin/codex-browser [--exec] [--cpa] [prompt]` starts the ChatGPT app
+  (required: it provides the browser channel) and Chrome, wraps `caffeinate -i`, uses the app's
+  bundled codex (matches the plugin) and warns when app, config and plugin versions differ.
 
+## Browser profiles (2026-10-29)
+
+Each browser-using agent has its own Chrome profile; its instruction file has a `## Browser`
+block (profile, script-first/computer-use fallback, decision routing). Backups: `*.bak-20261029-browser`.
+
+| Agent | Chrome profile (directory) | Where it's set |
+|---|---|---|
+| Codex Browser | Your Chrome (`Default`) | `~/.codex/browser.config.toml` |
+| Claude | Claude (`Profile 3`, Claude in Chrome) | `~/.claude/output-styles/project-head.md` |
+| Pi | pi (`agent-pi`) | `~/.pi/agent/APPEND_SYSTEM.md` |
+| Antigravity | antigravity (`agent-antigravity`) | `~/.gemini/config/AGENTS.md` |
+| Hermes | hermes (`agent-hermes`) | `~/.hermes/SOUL.md`; `browser.real_profile_pin` in `~/.hermes/config.yaml` |
+| Devin | devin (`agent-devin`) | `~/.devin/global_rules.md` |
+| OpenCode | opencode (`agent-opencode`) | `~/.config/opencode/instructions/frontend-builder.md` |
+| OpenClaw | its managed `openclaw` browser profile | workspace `AGENTS.md` |
+
+New profiles are signed out; the owner signs each in. Copilot, Cursor, DeepSeek Harness, Prime
+and Grok have no profile (no real-browser work).
