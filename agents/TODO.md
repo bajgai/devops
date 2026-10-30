@@ -164,3 +164,17 @@ Recorded per agent as each one is finished.
 - **Tools:** unchanged: MCP `firecrawl`, `cua`, `cua-driver`; built-in web search and fetch.
 - **Access:** unchanged: `openai/gpt-6.1-sol`; exec `auto` on the gateway; elevated commands
   only from the owner's Telegram.
+
+### 16. Codex Browser on GPT-6.1 Terra (2026-10-29)
+
+- **Personality:** Browser operator in the owner's logged-in Chrome: new tabs only, closes its
+  own, never buys/posts/sends/deletes or bypasses logins, captchas or 2FA. `developer_instructions`
+  in the `browser` profile, `~/.codex/browser.config.toml`.
+- **Tools:** bundled `chrome@openai-bundled` plugin (ChatGPT for Chrome extension, Default
+  profile) through `node_repl`; told to skip the in-app browser, the synced `chrome-browser`
+  skill (written for claude-in-chrome tools) and `cua_repl`.
+- **Access:** model `gpt-6.1-terra`, effort medium, ChatGPT login (not CLIProxyAPI).
+  `~/.codex/browser/config.toml`: `approval_mode` and `download_approval_mode` `never_ask`,
+  `full_cdp_access_enabled = true` (set by the owner in the ChatGPT app). The ChatGPT desktop
+  app must be running; without it the plugin fails with "browser access host is unavailable".
+
