@@ -325,8 +325,8 @@ def record(meta, status, usage, started_ns, ttfb_ns, error=None):
         err = error or u.get("error") or (str(status) if status and status >= 400 else "")
         attrs = {
             "gen_ai.operation.name": op,
-            "gen_ai.provider.name": "anthropic",
-            "gen_ai.system": "anthropic",
+            "gen_ai.provider.name": "anthropic" if meta["route"] == "anthropic" else "cliproxyapi",
+            "gen_ai.system": "anthropic" if meta["route"] == "anthropic" else "cliproxyapi",
             "gen_ai.request.model": model,
             "gen_ai.request.max_tokens": meta.get("max_tokens"),
             "gen_ai.response.model": u.get("model"),
