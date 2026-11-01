@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Route Claude Code's API traffic by model.
+
+claude-* models (and every non-messages request) go to api.anthropic.com untouched, so Claude
+Code's own claude.ai OAuth login pays for them. Any other model goes to CLIProxyAPI with the
+`claude` gateway key; the OAuth token is stripped before it leaves for CPA.
+
+Claude Code points here via ANTHROPIC_BASE_URL in ~/.claude/settings.json.
+LaunchAgent: ~/Library/LaunchAgents/com.bajgai.claude-model-router.plist
+"""
+import http.client
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+LISTEN = ("127.0.0.1", int(os.environ.get("ROUTER_PORT", "8319")))
+ANTHROPIC = ("https", "api.anthropic.com", 443)
+CPA = ("http", "127.0.0.1", 8317)
+HOP = {"host", "connection", "keep-alive", "proxy-connection", "te", "trailer",
+       "transfer-encoding", "upgrade", "content-length"}
+AUTH = {"authorization", "x-api-key"}
+
+CPA_KEY = subprocess.run(["llm-gateway-key", "claude"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+local = threading.local()
+
+# Antigravity answers 429 RESOURCE_EXHAUSTED to Claude Code's non-interactive identity sentence
+# (sent by `claude -p` and background Agent-tool teammates). Swap it for the interactive one,
+# which passes. Evidence: ~/src/orca-owner/.state/artifacts/gemini-cpa-probe/FINDINGS.md
+SDK_LINE = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+OK_LINE = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def fix_identity(body):
+    """Return body with the SDK identity sentence replaced in the system prompt, or unchanged."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    system = data.get("system")
+    hit = False
+    if isinstance(system, str) and SDK_LINE in system:
+        data["system"], hit = system.replace(SDK_LINE, OK_LINE), True
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and SDK_LINE in str(block.get("text", "")):
+                block["text"], hit = block["text"].replace(SDK_LINE, OK_LINE), True
+    return json.dumps(data).encode() if hit else body
+
+
+def log(msg):
+    sys.stderr.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    sys.stderr.flush()
+
+
+def conn(target):
+    pool = local.__dict__.setdefault("pool", {})
+    c = pool.get(target)
+    if c is None:
+        scheme, host, port = target
+        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        c = pool[target] = cls(host, port, timeout=600)
+    return c
+
+
+def drop(target):
+    c = local.__dict__.get("pool", {}).pop(target, None)
+    if c:
+        c.close()
+
+
+class Router(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def handle_any(self):
+        body = self.rfile.read(int(self.headers.get("content-length") or 0))
+        model = ""
+        if self.command == "POST" and urlsplit(self.path).path.startswith("/v1/messages"):
+            try:
+                model = json.loads(body).get("model", "")
+            except (ValueError, AttributeError):
+                pass
+        to_cpa = bool(model) and not model.startswith("claude-")
+        target = CPA if to_cpa else ANTHROPIC
+        if to_cpa and "gemini" in model:
+            body = fix_identity(body)
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if to_cpa:
+            headers = {k: v for k, v in headers.items() if k.lower() not in AUTH}
+            headers["x-api-key"] = CPA_KEY
+        headers["Host"] = target[1]
+        if body or self.command in ("POST", "PUT", "PATCH"):
+            headers["Content-Length"] = str(len(body))
+
+        for attempt in (1, 2):
+            c = conn(target)
+            try:
+                c.request(self.command, self.path, body=body, headers=headers)
+                resp = c.getresponse()
+                break
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+                    http.client.CannotSendRequest):
+                drop(target)
+                if attempt == 2:
+                    raise
+        log(f"{self.command} {urlsplit(self.path).path} model={model or '-'} "
+            f"-> {'cpa' if to_cpa else 'anthropic'} {resp.status}")
+
+        self.send_response_only(resp.status, resp.reason)
+        length = resp.getheader("content-length")
+        for k, v in resp.getheaders():
+            if k.lower() not in HOP:
+                self.send_header(k, v)
+        chunked = length is None and self.command != "HEAD"
+        if length is not None:
+            self.send_header("Content-Length", length)
+        elif chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        while self.command != "HEAD" and (chunk := resp.read1(65536)):
+            if chunked:
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            else:
+                self.wfile.write(chunk)
+            self.wfile.flush()
+        if chunked:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        resp.close()
+        if resp.will_close:
+            drop(target)
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = handle_any
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(LISTEN, Router)
+    server.daemon_threads = True
+    log(f"listening on {LISTEN[0]}:{LISTEN[1]}")
+    server.serve_forever()
