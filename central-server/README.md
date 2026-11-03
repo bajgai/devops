@@ -24,8 +24,8 @@ Clients use `vps2:<port>` (MagicDNS) or `100.65.14.115:<port>`.
 
 | Service | Today | Target on vps2 | Tailnet port | State to move | Status |
 |---|---|---|---|---|---|
-| patchbay | vps2 `/srv/patchbay` | as is | (check) | none | in place |
-| RAGFlow v1.0.0-rc3 | Mac Colima `ragflow`, 127.0.0.1 | `/opt/ragflow`, amd64 image, new infra passwords, OpenAI embeddings | 9380 API+MCP, 80 UI | none (0 datasets) | phase 1 |
+| deer-flow unit (deer-flow, its patchbay, crawl4ai, searxng) | vps2 | **Mac**, Colima VM `deerflow` (4 CPU/6 GB/60 GB), same paths inside the VM (`/opt/deer-flow`, `/srv/patchbay`, `/srv/crawl4ai`, `/opt/searxng`); UI `localhost:2026`, patchbay UI `localhost:18790` | none (Mac only) | `backend/.deer-flow` (4.1 GB sqlite, compresses ~50x), `/srv/patchbay/data` | phase 0, owner decision 2026-11-02 |
+| RAGFlow v1.0.0-rc3 | Mac Colima `ragflow`, 127.0.0.1 | `/opt/ragflow`, amd64 image, new infra passwords, OpenAI embeddings | 9380 API+MCP, 80 UI | none (0 datasets) | phase 1: **running on vps2** 2026-11-03, healthz ok; clients not yet repointed |
 | agent-otel (otel-lgtm) | Mac Colima `otel`, 3300/4317/4318 on all interfaces | `/opt/agent-otel`, Grafana 3300, OTLP on tailnet IP | 3300, 4317, 4318 | `otel-lgtm-data` 1.27 GB (or start fresh) | phase 2, needs owner OK |
 | cliproxyapi | Mac Colima `cliproxyapi`, 127.0.0.1:8317, local arm64 image | rebuild amd64 image, copy conf/auth/gflow volumes | 8317 | OAuth logins, config | phase 3, needs owner OK |
 
@@ -64,3 +64,16 @@ Current need (measured idle, OpenAI embeddings): ~5.5 GB on vps2 with deer-flow,
 ## Log
 
 - 2026-11-02 vps2 chosen. Plan written.
+- 2026-11-02 Owner: move the deer-flow unit to the Mac first (patchbay stays inside deer-flow's netns, so it
+  moves with it, not central). Mac RAGFlow Colima stopped to free RAM (Mac has 18 GB). Mac↔vps2 single
+  TCP stream runs ~0.3 MB/s on this network; use zstd + tar. On the Mac, the gateway's DooD socket is the
+  VM's rootful Docker (VM boundary), so `deerflow-sandbox-owner` (rootless deersb helper) is not carried over.
+  Mac's own native patchbay (`com.bajgai.patchbay`, 127.0.0.1:8790) is separate and untouched.
+- 2026-11-03 deer-flow unit cut over to the Mac (vps2 down 01:36 UTC, Mac up ~01:45). 4.2 GB data moved
+  in 44 s with zstd (sha256 + file counts matched). Colima fix: `host.docker.internal` pinned to
+  172.17.0.1 in deer-flow's compose (Colima's host-gateway is the Mac). df-research and `pb-deerflow` now
+  target the VM. vps2 deer-flow containers stopped (not removed), its Codex timer disabled.
+- 2026-11-03 RAGFlow started on vps2 (`/opt/ragflow`, all ports 127.0.0.1). Tailnet-only shares:
+  `https://vps2.tailcb0867.ts.net/` → UI :80, `vps2.tailcb0867.ts.net:9380` → API+MCP. Public :9380 times out.
+  Next: owner creates the RAGFlow account + API key, then repoint yt-video-gen `.env` RAGFLOW_* and retire
+  the Mac `ragflow` Colima.
