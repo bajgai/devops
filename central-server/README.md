@@ -27,7 +27,7 @@ Clients use `vps2:<port>` (MagicDNS) or `100.65.14.115:<port>`.
 | deer-flow unit (deer-flow, its patchbay, crawl4ai, searxng) | vps2 | **Mac**, Colima VM `deerflow` (4 CPU/6 GB/60 GB), same paths inside the VM (`/opt/deer-flow`, `/srv/patchbay`, `/srv/crawl4ai`, `/opt/searxng`); UI `localhost:2026`, patchbay UI `localhost:18790` | none (Mac only) | `backend/.deer-flow` (4.1 GB sqlite, compresses ~50x), `/srv/patchbay/data` | phase 0, owner decision 2026-11-02 |
 | RAGFlow v1.0.0-rc3 | Mac Colima `ragflow`, 127.0.0.1 | `/opt/ragflow`, amd64 image, new infra passwords, OpenAI embeddings | 9380 API+MCP, 80 UI | none (0 datasets) | phase 1: **running on vps2** 2026-11-03, healthz ok; clients not yet repointed |
 | agent-otel (otel-lgtm) | Mac Colima `otel`, 3300/4317/4318 on all interfaces | `/opt/agent-otel`, Grafana 3300, OTLP on tailnet IP | 3300, 4317, 4318 | `otel-lgtm-data` 1.27 GB (or start fresh) | phase 2, needs owner OK |
-| cliproxyapi | Mac Colima `cliproxyapi`, 127.0.0.1:8317, local arm64 image | rebuild amd64 image, copy conf/auth/gflow volumes | 8317 | OAuth logins, config | phase 3, needs owner OK |
+| cliproxyapi | Mac Colima `cliproxyapi`, 127.0.0.1:8317, live image is already linux/amd64 (emulated on the arm64 VM) | `/opt/cliproxyapi/compose.yaml`, same image `sha256:719489d7…`, copy conf/auth/gflow volumes | 8317 | OAuth logins, config, gflow DB | phase 3 prep done 2026-11-04 (image + compose staged); cutover needs owner window |
 
 Clients to repoint: yt-video-gen `.env` (RAGFLOW_*); Mac otelcol-gateway + vps1/vps2 otelcol-vps
 exporters; `~/.codex/config.toml`, `~/.config/opencode/opencode.jsonc`,
@@ -77,3 +77,10 @@ Current need (measured idle, OpenAI embeddings): ~5.5 GB on vps2 with deer-flow,
   `https://vps2.tailcb0867.ts.net/` → UI :80, `vps2.tailcb0867.ts.net:9380` → API+MCP. Public :9380 times out.
   Next: owner creates the RAGFlow account + API key, then repoint yt-video-gen `.env` RAGFLOW_* and retire
   the Mac `ragflow` Colima.
+- 2026-11-04 cliproxyapi prep: the live gateway image `local/cliproxyapi-cursor:8.0.48-cursor-sse1-0.6.6-trixie-en`
+  was already amd64, so no rebuild; copied as-is (`docker save | zstd | ssh docker load`, 35 s), same image ID
+  `sha256:719489d7…` on vps2. Boot test on 127.0.0.1:18317 with a throwaway config and no auth: v8.0.48+cursor-sse1
+  starts, no key 401, key 200; container removed. `compose.yaml` from llm-gateway `staging/a1/` staged at
+  `/opt/cliproxyapi/` (0700). Not done: external volumes `cliproxyapi-{conf,auth,gflow}` (created and filled at
+  cutover from stopped-state copies), `tailscale serve --tcp 8317`, client repoints. Image is never pushed to a registry
+  (plugin-local state).
