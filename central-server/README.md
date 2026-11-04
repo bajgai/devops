@@ -27,7 +27,7 @@ Clients use `vps2:<port>` (MagicDNS) or `100.65.14.115:<port>`.
 | deer-flow unit (deer-flow, its patchbay, crawl4ai, searxng) | vps2 | **Mac**, Colima VM `deerflow` (4 CPU/6 GB/60 GB), same paths inside the VM (`/opt/deer-flow`, `/srv/patchbay`, `/srv/crawl4ai`, `/opt/searxng`); UI `localhost:2026`, patchbay UI `localhost:18790` | none (Mac only) | `backend/.deer-flow` (4.1 GB sqlite, compresses ~50x), `/srv/patchbay/data` | phase 0, owner decision 2026-11-02 |
 | RAGFlow v1.0.0-rc3 | Mac Colima `ragflow`, 127.0.0.1 | `/opt/ragflow`, amd64 image, new infra passwords, OpenAI embeddings | 9380 API+MCP, 80 UI | none (0 datasets) | phase 1: **running on vps2** 2026-11-03, healthz ok; clients not yet repointed |
 | agent-otel (otel-lgtm) | Mac Colima `otel`, 3300/4317/4318 on all interfaces | `/opt/agent-otel`, Grafana 3300, OTLP on tailnet IP | 3300, 4317, 4318 | `otel-lgtm-data` 1.27 GB (or start fresh) | phase 2, needs owner OK |
-| cliproxyapi | Mac Colima `cliproxyapi`, 127.0.0.1:8317, live image is already linux/amd64 (emulated on the arm64 VM) | `/opt/cliproxyapi/compose.yaml`, same image `sha256:719489d7…`, copy conf/auth/gflow volumes | 8317 | OAuth logins, config, gflow DB | phase 3 prep done 2026-11-04 (image + compose staged); cutover needs owner window |
+| cliproxyapi | Mac Colima `cliproxyapi`, 127.0.0.1:8317, live image is already linux/amd64 (emulated on the arm64 VM) | `/opt/cliproxyapi/compose.yaml`, same image `sha256:719489d7…`, copy conf/auth/gflow volumes | 8317 | OAuth logins, config, gflow DB | **live on vps2 2026-11-04** |
 
 Clients to repoint: yt-video-gen `.env` (RAGFLOW_*); Mac otelcol-gateway + vps1/vps2 otelcol-vps
 exporters; `~/.codex/config.toml`, `~/.config/opencode/opencode.jsonc`,
@@ -59,7 +59,6 @@ Current need (measured idle, OpenAI embeddings): ~5.5 GB on vps2 with deer-flow,
 ## Open decisions
 
 1. Phase 2: move Grafana history (1.27 GB) or start fresh.
-2. Phase 3: cutover time for cliproxy.
 
 ## Log
 
@@ -84,3 +83,11 @@ Current need (measured idle, OpenAI embeddings): ~5.5 GB on vps2 with deer-flow,
   `/opt/cliproxyapi/` (0700). Not done: external volumes `cliproxyapi-{conf,auth,gflow}` (created and filled at
   cutover from stopped-state copies), `tailscale serve --tcp 8317`, client repoints. Image is never pushed to a registry
   (plugin-local state).
+- 2026-11-04 cliproxyapi cut over to vps2 (owner go). Down 14:43:44-14:44:20 UTC (36 s). conf/auth/gflow volumes copied
+  from the stopped Mac container (gflow `tmp/` skipped; sha256 manifests matched), `docker compose up -d` in
+  `/opt/cliproxyapi`, `tailscale serve --tcp 8317`. Mac clients were NOT repointed: many more than three hardcode
+  127.0.0.1:8317 (claude-model-router, hermes x2, pi, cpa-usage-keeper, codex, opencode, raycast), so the Mac's
+  127.0.0.1:8317 is now LaunchAgent `com.bajgai.cliproxyapi-vps2-forward` (`ssh -N -L` over public :443, survives
+  Proton VPN, which breaks tailnet TCP). Check suite before/after identical (same pre-existing failures: dead Claude
+  refresh token, cursor provider serves no models; catalog 73 identical). Mac VM `cliproxyapi` stopped, kept;
+  reconcile agent booted out. Rollback: `~/src/llm-gateway/protected/cutover-vps2-20261104/rollback.sh`.
