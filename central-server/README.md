@@ -91,3 +91,7 @@ Current need (measured idle, OpenAI embeddings): ~5.5 GB on vps2 with deer-flow,
   Proton VPN, which breaks tailnet TCP). Check suite before/after identical (same pre-existing failures: dead Claude
   refresh token, cursor provider serves no models; catalog 73 identical). Mac VM `cliproxyapi` stopped, kept;
   reconcile agent booted out. Rollback: `~/src/llm-gateway/protected/cutover-vps2-20261104/rollback.sh`.
+- 2026-11-04 Claude OAuth re-logged on vps2 (the old refresh token was dead; same auth file, now active; Claude chat and
+  tool checks pass). Mac Colima `cliproxyapi` VM deleted at owner request and the reconcile plist disabled: no Mac rollback
+  remains. Still open: cursor provider loads but serves no models (pre-existing). Add a backup of the vps2
+  `cliproxyapi-{conf,auth,gflow}` volumes, since vps2 is now their only copy.
