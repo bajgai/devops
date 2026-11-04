@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Route Claude Code's API traffic by model.
+
+claude-* models (and every non-messages request) go to api.anthropic.com untouched, so Claude
+Code's own claude.ai OAuth login pays for them. Any other model goes to CLIProxyAPI with the
+`claude` gateway key; the OAuth token is stripped before it leaves for CPA.
+
+Claude Code points here via ANTHROPIC_BASE_URL in ~/.claude/settings.json.
+LaunchAgent: ~/Library/LaunchAgents/com.bajgai.claude-model-router.plist
+"""
+import http.client
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+LISTEN = ("127.0.0.1", int(os.environ.get("ROUTER_PORT", "8319")))
+ANTHROPIC = ("https", "api.anthropic.com", 443)
+CPA = ("http", "127.0.0.1", 8317)
+HOP = {"host", "connection", "keep-alive", "proxy-connection", "te", "trailer",
+       "transfer-encoding", "upgrade", "content-length"}
+AUTH = {"authorization", "x-api-key"}
+
+CPA_KEY = subprocess.run(["llm-gateway-key", "claude"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+local = threading.local()
+
+# Antigravity answers 429 RESOURCE_EXHAUSTED to Claude Code's non-interactive identity sentence
+# (sent by `claude -p` and background Agent-tool teammates). Swap it for the interactive one,
+# which passes. Evidence: ~/src/orca-owner/.state/artifacts/gemini-cpa-probe/FINDINGS.md
+SDK_LINE = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+OK_LINE = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def fix_identity(body):
+    """Return body with the SDK identity sentence replaced in the system prompt, or unchanged."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    system = data.get("system")
+    hit = False
+    if isinstance(system, str) and SDK_LINE in system:
+        data["system"], hit = system.replace(SDK_LINE, OK_LINE), True
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and SDK_LINE in str(block.get("text", "")):
+                block["text"], hit = block["text"].replace(SDK_LINE, OK_LINE), True
+    return json.dumps(data).encode() if hit else body
+
+
+def log(msg):
+    sys.stderr.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    sys.stderr.flush()
+
+
+# --- OpenTelemetry --------------------------------------------------------------------------
+# Stdlib-only OTLP/HTTP JSON exporter so the router keeps zero dependencies. Spans and metrics
+# go into bounded in-memory buffers; a daemon thread posts them in batches. Export failures are
+# swallowed: telemetry must never slow or break a proxied request. Honours OTEL_SDK_DISABLED,
+# OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES, OTEL_EXPORTER_OTLP_[TRACES_|METRICS_]ENDPOINT,
+# OTEL_EXPORTER_OTLP_HEADERS, OTEL_BSP_SCHEDULE_DELAY and OTEL_METRIC_EXPORT_INTERVAL (ms).
+DURATION_BUCKETS = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48,
+                    40.96, 81.92]
+
+
+def _kv(env):
+    out = {}
+    for part in os.environ.get(env, "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _attrs(d):
+    out = []
+    for k, v in d.items():
+        if v is None or v == "":
+            continue
+        if isinstance(v, bool):
+            val = {"boolValue": v}
+        elif isinstance(v, int):
+            val = {"intValue": str(v)}
+        elif isinstance(v, float):
+            val = {"doubleValue": v}
+        elif isinstance(v, (list, tuple)):
+            val = {"arrayValue": {"values": [{"stringValue": str(x)} for x in v]}}
+        else:
+            val = {"stringValue": str(v)}
+        out.append({"key": k, "value": val})
+    return out
+
+
+class Otel:
+    def __init__(self, service):
+        self.enabled = os.environ.get("OTEL_SDK_DISABLED", "").lower() != "true"
+        base = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+        if not base or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").startswith("grpc"):
+            base = "http://localhost:4318"
+        base = base.rstrip("/")
+        self.urls = {
+            "traces": os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", base + "/v1/traces"),
+            "metrics": os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", base + "/v1/metrics"),
+        }
+        self.headers = {"Content-Type": "application/json", **_kv("OTEL_EXPORTER_OTLP_HEADERS")}
+        res = {"service.name": service, "host.name": os.uname().nodename,
+               "telemetry.sdk.name": "claude-model-router-otlp-json", "telemetry.sdk.language": "python"}
+        res.update(_kv("OTEL_RESOURCE_ATTRIBUTES"))
+        if os.environ.get("OTEL_SERVICE_NAME"):
+            res["service.name"] = os.environ["OTEL_SERVICE_NAME"]
+        self.resource = {"attributes": _attrs(res)}
+        self.scope = {"name": "claude-model-router", "version": "1"}
+        self.lock = threading.Lock()
+        self.spans = []
+        self.counters = {}   # (name, attrs tuple) -> value
+        self.hists = {}      # attrs tuple -> [count, sum, bucket counts]
+        self.start_ns = time.time_ns()
+        self.span_delay = int(os.environ.get("OTEL_BSP_SCHEDULE_DELAY", "5000")) / 1000
+        self.metric_delay = int(os.environ.get("OTEL_METRIC_EXPORT_INTERVAL", "15000")) / 1000
+        if self.enabled:
+            threading.Thread(target=self._loop, daemon=True, name="otel-export").start()
+
+    def span(self, s):
+        with self.lock:
+            if len(self.spans) < 4096:   # drop rather than grow without bound
+                self.spans.append(s)
+
+    def add(self, name, value, attrs):
+        if not value:
+            return
+        key = (name, tuple(sorted((k, v) for k, v in attrs.items() if v not in (None, ""))))
+        with self.lock:
+            self.counters[key] = self.counters.get(key, 0) + value
+
+    def record_duration(self, seconds, attrs):
+        key = tuple(sorted((k, v) for k, v in attrs.items() if v not in (None, "")))
+        with self.lock:
+            h = self.hists.setdefault(key, [0, 0.0, [0] * (len(DURATION_BUCKETS) + 1)])
+            h[0] += 1
+            h[1] += seconds
+            h[2][next((i for i, b in enumerate(DURATION_BUCKETS) if seconds <= b),
+                      len(DURATION_BUCKETS))] += 1
+
+    def _post(self, kind, payload):
+        try:
+            data = json.dumps(payload).encode()
+            u = urlsplit(self.urls[kind])
+            cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+            c = cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=5)
+            c.request("POST", u.path or "/", body=data, headers=self.headers)
+            c.getresponse().read()
+            c.close()
+        except Exception:   # collector down or slow: drop this batch silently
+            pass
+
+    def _flush_spans(self):
+        with self.lock:
+            batch, self.spans = self.spans, []
+        for i in range(0, len(batch), 512):
+            self._post("traces", {"resourceSpans": [{"resource": self.resource, "scopeSpans": [
+                {"scope": self.scope, "spans": batch[i:i + 512]}]}]})
+
+    def _flush_metrics(self):
+        now = str(time.time_ns())
+        start = str(self.start_ns)
+        with self.lock:
+            counters = dict(self.counters)
+            hists = {k: [v[0], v[1], list(v[2])] for k, v in self.hists.items()}
+        if not counters and not hists:
+            return
+        units = {"gen_ai.proxy.requests": "{request}", "gen_ai.proxy.tokens": "{token}"}
+        by_name = {}
+        for (name, attrs), value in counters.items():
+            by_name.setdefault(name, []).append({"attributes": _attrs(dict(attrs)),
+                                                 "startTimeUnixNano": start,
+                                                 "timeUnixNano": now, "asInt": str(value)})
+        metrics = [{"name": n, "unit": units.get(n, "1"),
+                    "sum": {"dataPoints": pts, "aggregationTemporality": 2, "isMonotonic": True}}
+                   for n, pts in by_name.items()]
+        if hists:
+            metrics.append({"name": "gen_ai.client.operation.duration", "unit": "s",
+                            "description": "Proxied GenAI request duration", "histogram": {
+                                "aggregationTemporality": 2, "dataPoints": [
+                                    {"attributes": _attrs(dict(k)), "startTimeUnixNano": start,
+                                     "timeUnixNano": now, "count": str(v[0]), "sum": v[1],
+                                     "bucketCounts": [str(x) for x in v[2]],
+                                     "explicitBounds": DURATION_BUCKETS}
+                                    for k, v in hists.items()]}})
+        self._post("metrics", {"resourceMetrics": [{"resource": self.resource, "scopeMetrics": [
+            {"scope": self.scope, "metrics": metrics}]}]})
+
+    def _loop(self):
+        last_metrics = time.monotonic()
+        while True:
+            time.sleep(self.span_delay)
+            try:
+                self._flush_spans()
+                if time.monotonic() - last_metrics >= self.metric_delay:
+                    last_metrics = time.monotonic()
+                    self._flush_metrics()
+            except Exception:
+                pass
+
+
+OTEL = Otel("claude-model-router")
+
+
+def client_name(ua):
+    """Best-effort calling-client label from the User-Agent."""
+    ua = (ua or "").lower()
+    for needle, name in (("claude-cli", "claude-code"), ("claude-code", "claude-code"),
+                         ("codex", "codex"), ("cursor", "cursor"), ("hermes", "hermes"),
+                         ("opencode", "opencode"), ("openclaw", "openclaw"), ("pi-", "pi"),
+                         ("anthropic/", "anthropic-sdk"), ("python", "python"), ("curl", "curl")):
+        if needle in ua:
+            return name
+    return "unknown" if ua else ""
+
+
+class Usage:
+    """Pull gen_ai usage out of an Anthropic Messages response (SSE or JSON) as it streams by."""
+
+    def __init__(self, content_type, encoding):
+        self.sse = "event-stream" in (content_type or "")
+        self.encoding = (encoding or "").lower()
+        self.buf = b""
+        # Streams arrive compressed when the client asked for it; inflate a copy as it passes.
+        import zlib
+        self.inflate = zlib.decompressobj(16 + zlib.MAX_WBITS if self.encoding == "gzip"
+                                          else zlib.MAX_WBITS) \
+            if self.sse and self.encoding in ("gzip", "deflate") else None
+        self.json_parts = []
+        self.json_size = 0
+        self.info = {}
+
+    def feed(self, chunk):
+        try:
+            if self.sse:
+                if self.inflate:
+                    chunk = self.inflate.decompress(chunk)
+                elif self.encoding and self.encoding != "identity":
+                    return
+                self.buf += chunk
+                *lines, self.buf = self.buf.split(b"\n")
+                for line in lines:
+                    if line.startswith(b"data:") and (b"usage" in line or b"message_start" in line):
+                        self._event(json.loads(line[5:]))
+                if len(self.buf) > 1 << 20:
+                    self.buf = b""
+            elif self.json_size < 8 << 20:
+                self.json_parts.append(chunk)
+                self.json_size += len(chunk)
+        except Exception:
+            pass
+
+    def finish(self):
+        try:
+            if not self.sse and self.json_parts:
+                raw = b"".join(self.json_parts)
+                if self.encoding in ("gzip", "deflate"):
+                    import zlib
+                    raw = zlib.decompress(raw, 16 + zlib.MAX_WBITS if self.encoding == "gzip"
+                                          else zlib.MAX_WBITS)
+                elif self.encoding and self.encoding != "identity":
+                    return self.info
+                msg = json.loads(raw)
+                if isinstance(msg, dict):
+                    if "input_tokens" in msg and "type" not in msg:   # count_tokens response
+                        self.info["input_tokens"] = msg["input_tokens"]
+                    else:
+                        self._message(msg)
+        except Exception:
+            pass
+        return self.info
+
+    def _usage(self, u):
+        for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                  "cache_creation_input_tokens"):
+            if isinstance(u.get(k), int):
+                self.info[k] = u[k]
+
+    def _message(self, m):
+        self.info.setdefault("id", m.get("id"))
+        self.info.setdefault("model", m.get("model"))
+        if m.get("stop_reason"):
+            self.info["stop_reason"] = m["stop_reason"]
+        if m.get("type") == "error" or "error" in m:
+            self.info["error"] = (m.get("error") or {}).get("type", "error")
+        self._usage(m.get("usage") or {})
+
+    def _event(self, ev):
+        t = ev.get("type")
+        if t == "message_start":
+            self._message(ev.get("message") or {})
+        elif t == "message_delta":
+            if (ev.get("delta") or {}).get("stop_reason"):
+                self.info["stop_reason"] = ev["delta"]["stop_reason"]
+            self._usage(ev.get("usage") or {})
+        elif t == "error":
+            self.info["error"] = (ev.get("error") or {}).get("type", "error")
+
+
+def parent_ids(header):
+    """(trace_id, parent_span_id) from a W3C traceparent header, else a fresh trace."""
+    parts = (header or "").split("-")
+    if len(parts) == 4 and len(parts[1]) == 32 and len(parts[2]) == 16:
+        return parts[1], parts[2]
+    return os.urandom(16).hex(), ""
+
+
+def record(meta, status, usage, started_ns, ttfb_ns, error=None):
+    """Turn one proxied request into a span plus metric points. Never raises."""
+    if not OTEL.enabled:
+        return
+    try:
+        end_ns = time.time_ns()
+        u = usage or {}
+        model = meta["model"]
+        op = meta["op"]
+        err = error or u.get("error") or (str(status) if status and status >= 400 else "")
+        attrs = {
+            "gen_ai.operation.name": op,
+            "gen_ai.provider.name": "anthropic" if meta["route"] == "anthropic" else "cliproxyapi",
+            "gen_ai.system": "anthropic" if meta["route"] == "anthropic" else "cliproxyapi",
+            "gen_ai.request.model": model,
+            "gen_ai.request.max_tokens": meta.get("max_tokens"),
+            "gen_ai.response.model": u.get("model"),
+            "gen_ai.response.id": u.get("id"),
+            "gen_ai.response.finish_reasons": [u["stop_reason"]] if u.get("stop_reason") else None,
+            "gen_ai.usage.input_tokens": u.get("input_tokens"),
+            "gen_ai.usage.output_tokens": u.get("output_tokens"),
+            "gen_ai.usage.cache_read.input_tokens": u.get("cache_read_input_tokens"),
+            "gen_ai.usage.cache_creation.input_tokens": u.get("cache_creation_input_tokens"),
+            "gen_ai.request.stream": meta.get("stream"),
+            "gen_ai.client.name": meta["client"],
+            "user_agent.original": meta["ua"],
+            "session.id": meta.get("session"),
+            "http.request.method": meta["method"],
+            "url.path": meta["path"],
+            "http.response.status_code": status,
+            "server.address": meta["upstream"],
+            "router.route": meta["route"],
+            "router.response_encoding": meta.get("encoding"),
+            "router.time_to_first_byte_ms": round((ttfb_ns - started_ns) / 1e6, 1) if ttfb_ns else None,
+            "error.type": err or None,
+        }
+        name = f"{op} {model}" if model else f"{meta['method']} {meta['path']}"
+        span = {"traceId": meta["trace_id"], "spanId": os.urandom(8).hex(), "name": name,
+                "kind": 3, "startTimeUnixNano": str(started_ns), "endTimeUnixNano": str(end_ns),
+                "attributes": _attrs(attrs), "status": {"code": 2 if err else 1}}
+        if meta["parent"]:
+            span["parentSpanId"] = meta["parent"]
+        if err:
+            span["status"]["message"] = str(err)
+        OTEL.span(span)
+        dims = {"gen_ai.operation.name": op, "gen_ai.request.model": model or "-",
+                "gen_ai.client.name": meta["client"] or "unknown", "router.route": meta["route"],
+                "http.response.status_code": str(status or 0)}
+        OTEL.add("gen_ai.proxy.requests", 1, dims)
+        OTEL.record_duration((end_ns - started_ns) / 1e9, dims)
+        tok = {k: dims[k] for k in ("gen_ai.request.model", "gen_ai.client.name", "router.route")}
+        for kind, key in (("input", "input_tokens"), ("output", "output_tokens"),
+                          ("cache_read", "cache_read_input_tokens"),
+                          ("cache_creation", "cache_creation_input_tokens")):
+            if op == "chat" and isinstance(u.get(key), int):
+                OTEL.add("gen_ai.proxy.tokens", u[key], {**tok, "gen_ai.token.type": kind})
+    except Exception:
+        pass
+
+
+def conn(target):
+    pool = local.__dict__.setdefault("pool", {})
+    c = pool.get(target)
+    if c is None:
+        scheme, host, port = target
+        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        c = pool[target] = cls(host, port, timeout=600)
+    return c
+
+
+def drop(target):
+    c = local.__dict__.get("pool", {}).pop(target, None)
+    if c:
+        c.close()
+
+
+class Router(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def handle_any(self):
+        started_ns = time.time_ns()
+        body = self.rfile.read(int(self.headers.get("content-length") or 0))
+        model = ""
+        path = urlsplit(self.path).path
+        req = {}
+        if self.command == "POST" and path.startswith("/v1/messages"):
+            try:
+                req = json.loads(body)
+                model = req.get("model", "")
+            except (ValueError, AttributeError):
+                req = {}
+        to_cpa = bool(model) and not model.startswith("claude-")
+        target = CPA if to_cpa else ANTHROPIC
+        if to_cpa and "gemini" in model:
+            body = fix_identity(body)
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if to_cpa:
+            headers = {k: v for k, v in headers.items() if k.lower() not in AUTH}
+            headers["x-api-key"] = CPA_KEY
+        if model and "br" in headers.get("Accept-Encoding", headers.get("accept-encoding", "")):
+            for k in [k for k in headers if k.lower() == "accept-encoding"]:
+                del headers[k]
+            headers["Accept-Encoding"] = "gzip, deflate"   # brotli has no stdlib decoder
+        headers["Host"] = target[1]
+        if body or self.command in ("POST", "PUT", "PATCH"):
+            headers["Content-Length"] = str(len(body))
+
+        trace_id, parent = parent_ids(self.headers.get("traceparent"))
+        ua = self.headers.get("user-agent", "")
+        meta = {"model": model, "method": self.command, "path": path, "ua": ua,
+                "op": ("chat" if path == "/v1/messages" else path.rsplit("/", 1)[-1])
+                if model else "http",
+                "client": self.headers.get("x-app-client") or client_name(ua),
+                "session": self.headers.get("x-claude-code-session-id"),
+                "max_tokens": req.get("max_tokens") if isinstance(req, dict) else None,
+                "stream": req.get("stream") if isinstance(req, dict) else None,
+                "route": "cpa" if to_cpa else "anthropic", "upstream": target[1],
+                "trace_id": trace_id, "parent": parent}
+        try:
+            for attempt in (1, 2):
+                c = conn(target)
+                try:
+                    c.request(self.command, self.path, body=body, headers=headers)
+                    resp = c.getresponse()
+                    break
+                except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+                        http.client.CannotSendRequest):
+                    drop(target)
+                    if attempt == 2:
+                        raise
+        except Exception as e:
+            record(meta, 0, None, started_ns, 0, error=type(e).__name__)
+            raise
+        ttfb_ns = time.time_ns()
+        meta["encoding"] = resp.getheader("content-encoding")
+        usage = Usage(resp.getheader("content-type"), resp.getheader("content-encoding")) \
+            if model else None
+        log(f"{self.command} {urlsplit(self.path).path} model={model or '-'} "
+            f"-> {'cpa' if to_cpa else 'anthropic'} {resp.status}")
+
+        self.send_response_only(resp.status, resp.reason)
+        length = resp.getheader("content-length")
+        for k, v in resp.getheaders():
+            if k.lower() not in HOP:
+                self.send_header(k, v)
+        chunked = length is None and self.command != "HEAD"
+        if length is not None:
+            self.send_header("Content-Length", length)
+        elif chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            while self.command != "HEAD" and (chunk := resp.read1(65536)):
+                if chunked:
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                else:
+                    self.wfile.write(chunk)
+                self.wfile.flush()
+                if usage:
+                    usage.feed(chunk)
+            if chunked:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+        except Exception as e:
+            record(meta, resp.status, usage.finish() if usage else None, started_ns, ttfb_ns,
+                   error=type(e).__name__)
+            raise
+        record(meta, resp.status, usage.finish() if usage else None, started_ns, ttfb_ns)
+        resp.close()
+        if resp.will_close:
+            drop(target)
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = handle_any
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(LISTEN, Router)
+    server.daemon_threads = True
+    log(f"listening on {LISTEN[0]}:{LISTEN[1]}")
+    server.serve_forever()
