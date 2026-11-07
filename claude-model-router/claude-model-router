@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Route Claude Code's API traffic by model.
 
-claude-* models (and every non-messages request) go to api.anthropic.com untouched, so Claude
-Code's own claude.ai OAuth login pays for them. Any other model goes to CLIProxyAPI with the
-`claude` gateway key; the OAuth token is stripped before it leaves for CPA.
+Every /v1/messages* request (any model, claude-* included since 2026-11-07) goes to CLIProxyAPI
+with the `claude` gateway key; the OAuth token is stripped before it leaves for CPA. Non-messages
+requests go to api.anthropic.com untouched. If CPA is unreachable or answers 401/403/429/5xx for a
+claude-* model, the same request is retried once against api.anthropic.com with Claude Code's own
+OAuth login, before any byte reaches the client.
+ROUTER_CLAUDE_VIA_CPA=0 restores the old split (claude-* direct to Anthropic).
+ROUTER_CPA_PORT overrides the CPA port (testing only).
 
 Claude Code points here via ANTHROPIC_BASE_URL in ~/.claude/settings.json.
 LaunchAgent: ~/Library/LaunchAgents/com.bajgai.claude-model-router.plist
@@ -20,7 +24,9 @@ from urllib.parse import urlsplit
 
 LISTEN = ("127.0.0.1", int(os.environ.get("ROUTER_PORT", "8319")))
 ANTHROPIC = ("https", "api.anthropic.com", 443)
-CPA = ("http", "127.0.0.1", 8317)
+CPA = ("http", "127.0.0.1", int(os.environ.get("ROUTER_CPA_PORT", "8317")))
+CLAUDE_VIA_CPA = os.environ.get("ROUTER_CLAUDE_VIA_CPA", "1") != "0"
+FALLBACK_STATUS = {401, 403, 429, 500, 502, 503, 504}
 HOP = {"host", "connection", "keep-alive", "proxy-connection", "te", "trailer",
        "transfer-encoding", "upgrade", "content-length"}
 AUTH = {"authorization", "x-api-key"}
@@ -407,22 +413,31 @@ class Router(BaseHTTPRequestHandler):
                 model = req.get("model", "")
             except (ValueError, AttributeError):
                 req = {}
-        to_cpa = bool(model) and not model.startswith("claude-")
+        is_claude = model.startswith("claude-")
+        to_cpa = bool(model) and (CLAUDE_VIA_CPA or not is_claude)
+        can_fallback = to_cpa and is_claude      # Claude Code's own login can serve these
         target = CPA if to_cpa else ANTHROPIC
+        direct_body = body
         if to_cpa and "gemini" in model:
             body = fix_identity(body)
 
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-        if to_cpa:
-            headers = {k: v for k, v in headers.items() if k.lower() not in AUTH}
-            headers["x-api-key"] = CPA_KEY
-        if model and "br" in headers.get("Accept-Encoding", headers.get("accept-encoding", "")):
-            for k in [k for k in headers if k.lower() == "accept-encoding"]:
-                del headers[k]
-            headers["Accept-Encoding"] = "gzip, deflate"   # brotli has no stdlib decoder
-        headers["Host"] = target[1]
-        if body or self.command in ("POST", "PUT", "PATCH"):
-            headers["Content-Length"] = str(len(body))
+        base = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if model and "br" in base.get("Accept-Encoding", base.get("accept-encoding", "")):
+            for k in [k for k in base if k.lower() == "accept-encoding"]:
+                del base[k]
+            base["Accept-Encoding"] = "gzip, deflate"   # brotli has no stdlib decoder
+
+        def headers_for(tgt, payload):
+            h = dict(base)
+            if tgt is CPA:
+                h = {k: v for k, v in h.items() if k.lower() not in AUTH}
+                h["x-api-key"] = CPA_KEY
+            h["Host"] = tgt[1]
+            if payload or self.command in ("POST", "PUT", "PATCH"):
+                h["Content-Length"] = str(len(payload))
+            return h
+
+        headers = headers_for(target, body)
 
         trace_id, parent = parent_ids(self.headers.get("traceparent"))
         ua = self.headers.get("user-agent", "")
@@ -435,18 +450,41 @@ class Router(BaseHTTPRequestHandler):
                 "stream": req.get("stream") if isinstance(req, dict) else None,
                 "route": "cpa" if to_cpa else "anthropic", "upstream": target[1],
                 "trace_id": trace_id, "parent": parent}
-        try:
+        def send(tgt, payload, hdrs):
             for attempt in (1, 2):
-                c = conn(target)
+                c = conn(tgt)
                 try:
-                    c.request(self.command, self.path, body=body, headers=headers)
-                    resp = c.getresponse()
-                    break
+                    c.request(self.command, self.path, body=payload, headers=hdrs)
+                    return c.getresponse()
                 except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
                         http.client.CannotSendRequest):
-                    drop(target)
+                    drop(tgt)
                     if attempt == 2:
                         raise
+
+        def go_direct(reason):
+            nonlocal target, to_cpa
+            log(f"{self.command} {path} model={model} cpa {reason} -> fallback anthropic")
+            meta["fallback"] = reason
+            target, to_cpa = ANTHROPIC, False
+            meta["route"], meta["upstream"] = "anthropic", ANTHROPIC[1]
+            return send(ANTHROPIC, direct_body, headers_for(ANTHROPIC, direct_body))
+
+        try:
+            try:
+                resp = send(target, body, headers)
+            except OSError as e:          # refused, reset, timeout: tunnel or vps2 down
+                drop(target)
+                if not can_fallback:
+                    raise
+                resp = go_direct(type(e).__name__)
+            else:
+                if can_fallback and resp.status in FALLBACK_STATUS:
+                    resp.read()
+                    resp.close()
+                    if resp.will_close:
+                        drop(CPA)
+                    resp = go_direct(f"http {resp.status}")
         except Exception as e:
             record(meta, 0, None, started_ns, 0, error=type(e).__name__)
             raise
