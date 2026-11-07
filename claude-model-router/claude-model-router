@@ -351,6 +351,7 @@ def record(meta, status, usage, started_ns, ttfb_ns, error=None):
             "http.response.status_code": status,
             "server.address": meta["upstream"],
             "router.route": meta["route"],
+            "router.fallback": meta.get("fallback"),
             "router.response_encoding": meta.get("encoding"),
             "router.time_to_first_byte_ms": round((ttfb_ns - started_ns) / 1e6, 1) if ttfb_ns else None,
             "error.type": err or None,
