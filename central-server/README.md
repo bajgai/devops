@@ -12,7 +12,7 @@ Tailscale only. Nothing new listens on the public internet.
 | Host | CPU | RAM | Free disk | Arch | Tailscale IP | Notes |
 |---|---|---|---|---|---|---|
 | vps2 (srv2113168) | 4 | 15.6 GB (12 free) | 157 GB | x86_64 | 100.65.14.115 | Arch, Docker 29.9, Compose 5.6, ufw on, sshd on 22+443, otelcol-vps on 127.0.0.1:4317-4319, `vm.max_map_count`=1048576 |
-| vps1 (srv1419372) | 2 | 7.7 GB | 82 GB | x86_64 | 100.92.10.29 | idle, no Docker, otelcol-vps inactive; public :22 closed, reach via `ssh -o HostName=100.92.10.29 vps1` |
+| vps1 (srv1419372) | 2 | 7.7 GB | 82 GB | x86_64 | 100.92.10.29 | Hermes + OpenClaw since 2026-11-10 (see `agents/vps1-hermes-openclaw.md`), no Docker, otelcol-vps inactive; public :22 closed, reach via `ssh -o HostName=100.92.10.29 vps1` |
 
 ## Exposure pattern
 
